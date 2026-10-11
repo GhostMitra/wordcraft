@@ -32,6 +32,11 @@ pub enum Dialog {
         hidden: bool,
         color: String,
         spacing: f32,
+        /// The properties the fields stood for when the dialog opened: OK sends only what the
+        /// user changed, so formatting the dialog can't show (a double underline) or left
+        /// alone stays as it is.
+        #[serde(skip)]
+        start: serde_json::Map<String, Value>,
     },
     Paragraph {
         /// Right-to-left reading order (Direction in Word's Paragraph dialog).
@@ -89,6 +94,10 @@ pub enum Dialog {
         left: f32,
         right: f32,
         landscape: bool,
+        /// Document grid: kind (0 none, 1 lines, 2 lines and characters, 3 snap to characters),
+        /// lines per page and characters per line; `grid_was` as opened (applied only if changed).
+        grid: (u8, u32, u32),
+        grid_was: (u8, u32, u32),
         /// Section direction: right to left (`layout.sectionRtl`).
         rtl: bool,
     },
@@ -130,6 +139,9 @@ pub enum Dialog {
     ModifyStyle {
         #[serde(skip)]
         back: bool,
+        /// The dialog that comes back when this closes (Table of Contents › Modify…).
+        #[serde(skip)]
+        resume: Option<Box<Dialog>>,
         id: String,
         name: String,
         font: String,
@@ -166,6 +178,9 @@ pub enum Dialog {
     },
     /// Columns, Symbol and Field ([`crate::dialogs_insert`], #321).
     Insert(Box<crate::dialogs_insert::InsertDialog>),
+    /// Caption, Index, Mark Index Entry, Table of Contents, Source Manager and Create / Edit
+    /// Source ([`crate::dialogs_refs`], #402).
+    Refs(Box<crate::dialogs_refs::RefsDialog>),
     /// Insert › Icons: the icon library, searchable and filtered by category (empty for all).
     Icons {
         query: String,
@@ -285,6 +300,8 @@ pub enum Dialog {
     TrackOptions {
         form: Box<crate::dialogs_lists::TrackForm>,
     },
+    /// Compare / Combine Documents and AutoCorrect Options ([`crate::dialogs_review`], #412).
+    Review(Box<crate::dialogs_review::ReviewDialog>),
     /// Tools › Customize Keyboard (#368).
     CustomizeKeyboard {
         form: Box<crate::dialogs_keyboard::KeyboardForm>,
@@ -293,6 +310,10 @@ pub enum Dialog {
     CustomizeRibbon {
         form: Box<crate::dialogs_ribbon::RibbonForm>,
     },
+    /// Developer › Controls › Properties.
+    Control {
+        form: Box<crate::dialogs_controls::ControlForm>,
+    },
     /// Home › Font › Enclose Characters: the style (`none` takes the enclosure away, `shrink`,
     /// `enlarge`), the text and the shape (`circle`, `square`, `triangle`, `diamond`).
     Enclose {
@@ -300,6 +321,12 @@ pub enum Dialog {
         text: String,
         shape: String,
     },
+    /// References › Footnotes › Footnote and Endnote (#385).
+    NoteOptions {
+        form: Box<crate::dialogs_notes::NoteForm>,
+    },
+    /// Line Numbers, Hyphenation, Language, Envelopes and Labels (#407).
+    Layout(Box<crate::dialogs_layout::LayoutDialog>),
 }
 
 /// The Table Properties dialog's fields. Lengths are in the interface unit
@@ -697,6 +724,7 @@ impl Dialog {
             Dialog::TableStyle { .. } => "modifyTableStyle",
             Dialog::Commands { .. } => "commands",
             Dialog::Insert(d) => d.name(),
+            Dialog::Refs(d) => d.name(),
             Dialog::Icons { .. } => "icons",
             Dialog::PasteSpecial { .. } => "pasteSpecial",
             Dialog::About { .. } => "about",
@@ -716,9 +744,13 @@ impl Dialog {
             Dialog::EncryptPassword { .. } => "encryptPassword",
             Dialog::DefineList { .. } => "defineList",
             Dialog::TrackOptions { .. } => "trackChangesOptions",
+            Dialog::Review(d) => d.name(),
             Dialog::CustomizeKeyboard { .. } => "customizeKeyboard",
             Dialog::CustomizeRibbon { .. } => "customizeRibbon",
+            Dialog::Control { .. } => "controlProperties",
             Dialog::Enclose { .. } => "enclose",
+            Dialog::NoteOptions { .. } => "noteOptions",
+            Dialog::Layout(d) => d.name(),
         }
     }
 
@@ -742,25 +774,42 @@ impl Dialog {
         if let Some(d) = crate::dialogs_insert::open(name, app) {
             return Some(Dialog::Insert(Box::new(d)));
         }
+        if let Some(d) = crate::dialogs_refs::open(name, app) {
+            return Some(Dialog::Refs(Box::new(d)));
+        }
+        if let Some(d) = crate::dialogs_layout::open(name, app) {
+            return Some(Dialog::Layout(Box::new(d)));
+        }
+        if matches!(name, "compare" | "combine" | "autoCorrect" | "restrictEditing") {
+            return crate::dialogs_review::open(name, app).map(|d| Dialog::Review(Box::new(d)));
+        }
         let st = app.session.run("format.state", &json!({})).unwrap_or_default();
         let s = |k: &str| st.get(k).and_then(Value::as_str).unwrap_or("").to_string();
         let b = |k: &str| st.get(k).and_then(Value::as_bool).unwrap_or(false);
         Some(match name {
-            "font" => Dialog::Font {
-                font: s("font"),
-                size: st.get("size").and_then(Value::as_f64).map(|v| v.to_string()).unwrap_or_default(),
-                bold: b("bold"),
-                italic: b("italic"),
-                underline: b("underline"),
-                strike: b("strike"),
-                sup: b("superscript"),
-                sub: b("subscript"),
-                small_caps: false,
-                caps: false,
-                hidden: false,
-                color: s("color"),
-                spacing: 0.0,
-            },
+            "font" => {
+                let mut d = Dialog::Font {
+                    font: s("font"),
+                    size: st.get("size").and_then(Value::as_f64).map(|v| v.to_string()).unwrap_or_default(),
+                    bold: b("bold"),
+                    italic: b("italic"),
+                    underline: b("underline"),
+                    strike: b("strike"),
+                    sup: b("superscript"),
+                    sub: b("subscript"),
+                    small_caps: b("smallCaps"),
+                    caps: b("caps"),
+                    hidden: b("hidden"),
+                    color: s("color"),
+                    spacing: st.get("spacing").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                    start: serde_json::Map::new(),
+                };
+                let props = font_props(&d);
+                if let Dialog::Font { start, .. } = &mut d {
+                    *start = props;
+                }
+                d
+            }
             "paragraph" | "asianTypography" => {
                 let rp = app.session.doc.para_at(&app.session.sel.focus).map(|p| app.session.doc.styles.resolve_para(&p.props));
                 let rp = rp?;
@@ -809,12 +858,23 @@ impl Dialog {
             "insertTable" => Dialog::InsertTable { rows: 2, cols: 5 },
             "pageSetup" => {
                 let sp = wordcraft_engine::cmd::page::sect(&app.session);
+                use wordcraft_doc::section::DocGridType;
+                let kind = match sp.doc_grid.map(|g| g.kind) {
+                    Some(DocGridType::Lines) => 1,
+                    Some(DocGridType::LinesAndChars) => 2,
+                    Some(DocGridType::SnapToChars) => 3,
+                    _ => 0,
+                };
+                let size = app.session.doc.styles.resolve_char(Some("Normal"), &Default::default()).size;
+                let grid = (kind, sp.grid_lines_per_page().min(1000), sp.grid_chars_per_line(size).min(1000));
                 Dialog::PageSetup {
                     top: sp.margin_top / 72.0,
                     bottom: sp.margin_bottom / 72.0,
                     left: sp.margin_left / 72.0,
                     right: sp.margin_right / 72.0,
                     landscape: sp.landscape,
+                    grid,
+                    grid_was: grid,
                     rtl: sp.rtl,
                 }
             }
@@ -918,6 +978,14 @@ impl Dialog {
             "customizeQuickAccess" => {
                 Dialog::CustomizeRibbon { form: Box::new(crate::dialogs_ribbon::RibbonForm::read(app, crate::dialogs_ribbon::Page::QuickAccess)) }
             }
+            "noteOptions" => Dialog::NoteOptions { form: Box::new(crate::dialogs_notes::NoteForm::read(app)) },
+            "controlProperties" => match crate::dialogs_controls::ControlForm::read(app) {
+                Some(form) => Dialog::Control { form: Box::new(form) },
+                None => {
+                    app.status(tl!("Put the caret in a content control first."));
+                    return None;
+                }
+            },
             _ => return None,
         })
     }
@@ -946,6 +1014,7 @@ impl Dialog {
         let rp = app.session.doc.styles.resolve_para(&wordcraft_doc::ParaProps { style: Some(id.into()), ..Default::default() });
         Some(Dialog::ModifyStyle {
             back: false,
+            resume: None,
             id: id.into(),
             name: st.name.clone(),
             font: rc.font,
@@ -1059,6 +1128,7 @@ pub fn show(app: &mut WordApp, ctx: &egui::Context) {
         Dialog::TableStyle { .. } => "Modify Table Style",
         Dialog::Commands { .. } => "Search Commands",
         Dialog::Insert(d) => d.title(),
+        Dialog::Refs(d) => d.title(),
         Dialog::Icons { .. } => "Icons",
         Dialog::PasteSpecial { .. } => "Paste Special",
         Dialog::About { .. } => "About WordCraft",
@@ -1078,9 +1148,13 @@ pub fn show(app: &mut WordApp, ctx: &egui::Context) {
         Dialog::EncryptPassword { .. } => "Encrypt with Password",
         Dialog::DefineList { .. } => "Define New Multilevel List",
         Dialog::TrackOptions { .. } => "Track Changes Options",
+        Dialog::Review(d) => d.title(),
         Dialog::CustomizeKeyboard { .. } => "Customize Keyboard",
         Dialog::CustomizeRibbon { .. } => "Customize Ribbon",
+        Dialog::Control { .. } => "Content Control Properties",
         Dialog::Enclose { .. } => "Enclose Characters",
+        Dialog::NoteOptions { .. } => "Footnote and Endnote",
+        Dialog::Layout(d) => d.title(),
     };
     let id = egui::Id::new(("dialog", title));
     let shown = place_dialog(ctx, id, egui::Window::new(tl!(title)).id(id).collapsible(false).resizable(false)).open(&mut open).show(ctx, |ui| {
@@ -1114,10 +1188,53 @@ pub(crate) fn buttons(ui: &mut Ui, ok: &str) -> (bool, bool) {
     r
 }
 
+/// The character properties the Font dialog's fields stand for.
+fn font_props(d: &Dialog) -> serde_json::Map<String, Value> {
+    let Dialog::Font { font, size, bold, italic, underline, strike, sup, sub, small_caps, caps, hidden, color, spacing, .. } = d else {
+        return serde_json::Map::new();
+    };
+    let mut props = serde_json::Map::new();
+    props.insert("bold".into(), json!(*bold));
+    props.insert("italic".into(), json!(*italic));
+    props.insert("strike".into(), json!(*strike));
+    props.insert("underline".into(), json!(if *underline { "single" } else { "none" }));
+    let vert = if *sup {
+        "superscript"
+    } else if *sub {
+        "subscript"
+    } else {
+        "baseline"
+    };
+    props.insert("vertAlign".into(), json!(vert));
+    props.insert("smallCaps".into(), json!(*small_caps));
+    props.insert("caps".into(), json!(*caps));
+    props.insert("hidden".into(), json!(*hidden));
+    props.insert("spacing".into(), json!(*spacing));
+    if !font.trim().is_empty() {
+        props.insert("font".into(), json!(font.trim()));
+    }
+    if let Ok(s) = size.trim().parse::<f64>() {
+        props.insert("size".into(), json!(s));
+    }
+    if let Some(c) = wordcraft_doc::Rgb::parse(color) {
+        props.insert("color".into(), json!({"Rgb": [c.0, c.1, c.2]}));
+    }
+    props
+}
+
+/// Font dialog OK: set the properties the user changed, leave the others alone.
+fn apply_font(app: &mut WordApp, d: &Dialog) {
+    let Dialog::Font { start, .. } = d else { return };
+    let changed: serde_json::Map<String, Value> = font_props(d).into_iter().filter(|(k, v)| start.get(k) != Some(v)).collect();
+    if !changed.is_empty() {
+        let _ = app.run("format.set", json!({"props": changed}));
+    }
+}
+
 /// Returns true to close.
 fn body(app: &mut WordApp, ui: &mut Ui, d: &mut Dialog) -> bool {
     match d {
-        Dialog::Font { font, size, bold, italic, underline, strike, sup, sub, small_caps, caps, hidden, color, spacing } => {
+        Dialog::Font { font, size, bold, italic, underline, strike, sup, sub, small_caps, caps, hidden, color, spacing, .. } => {
             // Build the sample text format for the preview pane below.
             let preview_size = size.trim().parse::<f32>().unwrap_or(12.0).clamp(6.0, 72.0);
             let preview_color = wordcraft_doc::Rgb::parse(color).map(crate::theme::c32).unwrap_or_else(|| ui.visuals().text_color());
@@ -1179,22 +1296,7 @@ fn body(app: &mut WordApp, ui: &mut Ui, d: &mut Dialog) -> bool {
             ui.label(job);
             let (ok, cancel) = buttons(ui, tl!("OK"));
             if ok {
-                let mut props = json!({
-                    "bold": *bold, "italic": *italic, "strike": *strike,
-                    "underline": if *underline { "single" } else { "none" },
-                    "vertAlign": if *sup { "superscript" } else if *sub { "subscript" } else { "baseline" },
-                    "smallCaps": *small_caps, "caps": *caps, "hidden": *hidden, "spacing": *spacing,
-                });
-                if !font.trim().is_empty() {
-                    props["font"] = json!(font.trim());
-                }
-                if let Ok(s) = size.trim().parse::<f64>() {
-                    props["size"] = json!(s);
-                }
-                if let Some(c) = wordcraft_doc::Rgb::parse(color) {
-                    props["color"] = json!({"Rgb": [c.0, c.1, c.2]});
-                }
-                let _ = app.run("format.set", json!({"props": props}));
+                apply_font(app, d);
             }
             ok || cancel
         }
@@ -1437,7 +1539,7 @@ fn body(app: &mut WordApp, ui: &mut Ui, d: &mut Dialog) -> bool {
             }
             ok || cancel
         }
-        Dialog::PageSetup { top, bottom, left, right, landscape, rtl } => {
+        Dialog::PageSetup { top, bottom, left, right, landscape, rtl, grid, grid_was } => {
             ui.label(egui::RichText::new(tl!("Margins")).font(semibold(12.5)));
             egui::Grid::new("ps").num_columns(4).show(ui, |ui| {
                 ui.label(tl!("Top:"));
@@ -1456,6 +1558,20 @@ fn body(app: &mut WordApp, ui: &mut Ui, d: &mut Dialog) -> bool {
                 ui.radio_value(landscape, false, tl!("Portrait"));
                 ui.radio_value(landscape, true, tl!("Landscape"));
             });
+            ui.label(egui::RichText::new(tl!("Document Grid")).font(semibold(12.5)));
+            ui.horizontal_wrapped(|ui| {
+                ui.radio_value(&mut grid.0, 0, tl!("No grid"));
+                ui.radio_value(&mut grid.0, 1, tl!("Lines only"));
+                ui.radio_value(&mut grid.0, 2, tl!("Lines and characters"));
+                ui.radio_value(&mut grid.0, 3, tl!("Text snaps to characters"));
+            });
+            egui::Grid::new("ps_grid").num_columns(4).show(ui, |ui| {
+                ui.add_enabled(grid.0 >= 2, egui::Label::new(tl!("Characters per line:")));
+                ui.add_enabled(grid.0 >= 2, egui::DragValue::new(&mut grid.2).range(1..=1000));
+                ui.add_enabled(grid.0 >= 1, egui::Label::new(tl!("Lines per page:")));
+                ui.add_enabled(grid.0 >= 1, egui::DragValue::new(&mut grid.1).range(1..=1000));
+                ui.end_row();
+            });
             ui.horizontal(|ui| {
                 ui.label(tl!("Section direction:"));
                 ui.radio_value(rtl, false, tl!("Left-to-right"));
@@ -1466,6 +1582,17 @@ fn body(app: &mut WordApp, ui: &mut Ui, d: &mut Dialog) -> bool {
                 let _ = app.run("layout.orientation", json!({"value": if *landscape { "landscape" } else { "portrait" }}));
                 let _ =
                     app.run("layout.margins", json!({"top": *top * 72.0, "bottom": *bottom * 72.0, "left": *left * 72.0, "right": *right * 72.0}));
+                if grid != grid_was {
+                    let kind = ["none", "lines", "linesAndChars", "snapToChars"].get(grid.0 as usize).copied().unwrap_or("none");
+                    let mut v = json!({"type": kind});
+                    if grid.1 != grid_was.1 {
+                        v["linesPerPage"] = json!(grid.1);
+                    }
+                    if grid.2 != grid_was.2 {
+                        v["charsPerLine"] = json!(grid.2);
+                    }
+                    let _ = app.run("layout.documentGrid", v);
+                }
                 if *rtl != wordcraft_engine::cmd::page::sect(&app.session).rtl {
                     let _ = app.run("layout.sectionRtl", json!({"value": *rtl}));
                 }
@@ -1640,7 +1767,7 @@ fn body(app: &mut WordApp, ui: &mut Ui, d: &mut Dialog) -> bool {
             }
             ok || cancel
         }
-        Dialog::ModifyStyle { back, id, name, font, size, bold, italic, color, before, after } => {
+        Dialog::ModifyStyle { back, resume, id, name, font, size, bold, italic, color, before, after } => {
             egui::Grid::new("ms").num_columns(2).show(ui, |ui| {
                 ui.label(tl!("Name:"));
                 ui.text_edit_singleline(name);
@@ -1676,6 +1803,11 @@ fn body(app: &mut WordApp, ui: &mut Ui, d: &mut Dialog) -> bool {
             }
             if (ok || cancel) && *back {
                 app.dialog = Some(Dialog::ManageStyles { alphabetical: false, selected: id.clone() });
+            }
+            if (ok || cancel)
+                && let Some(r) = resume.take()
+            {
+                app.dialog = Some(*r);
             }
             ok || cancel
         }
@@ -1772,6 +1904,7 @@ fn body(app: &mut WordApp, ui: &mut Ui, d: &mut Dialog) -> bool {
             ok || cancel
         }
         Dialog::Insert(f) => crate::dialogs_insert::body(app, ui, f),
+        Dialog::Refs(f) => crate::dialogs_refs::body(app, ui, f),
         Dialog::Commands { query } => {
             let r = ui.add(egui::TextEdit::singleline(query).hint_text(tl!("Type a command, e.g. \"insert table\"")).desired_width(380.0));
             r.request_focus();
@@ -2006,6 +2139,7 @@ fn body(app: &mut WordApp, ui: &mut Ui, d: &mut Dialog) -> bool {
         }
         Dialog::DefineList { form } => crate::dialogs_lists::define_list(app, ui, form),
         Dialog::TrackOptions { form } => crate::dialogs_lists::track_options(app, ui, form),
+        Dialog::Review(d) => crate::dialogs_review::body(app, ui, d),
         Dialog::CustomizeKeyboard { form } => crate::dialogs_keyboard::customize_keyboard(app, ui, form),
         Dialog::CustomizeRibbon { form } => crate::dialogs_ribbon::customize_ribbon(app, ui, form),
         Dialog::FieldCode { code, edit, message } => {
@@ -2032,6 +2166,7 @@ fn body(app: &mut WordApp, ui: &mut Ui, d: &mut Dialog) -> bool {
             }
             cancel
         }
+        Dialog::Control { form } => crate::dialogs_controls::body(app, ui, form),
         Dialog::SelectTable { sheets, selected, headers, message, params } => {
             ui.label(tl!("Choose the sheet that holds the recipients."));
             ui.add_space(4.0);
@@ -2067,6 +2202,8 @@ fn body(app: &mut WordApp, ui: &mut Ui, d: &mut Dialog) -> bool {
             }
             cancel
         }
+        Dialog::NoteOptions { form } => crate::dialogs_notes::note_options(app, ui, form),
+        Dialog::Layout(d) => crate::dialogs_layout::body(app, ui, d),
         Dialog::FindRecipient { text, message } => {
             ui.horizontal(|ui| {
                 ui.label(tl!("Find:"));
@@ -2413,7 +2550,7 @@ fn manage_styles(app: &mut WordApp, ui: &mut Ui, alphabetical: &mut bool, select
                     if let Some(Dialog::ModifyStyle { id, name, font, size, bold, italic, color, before, after, .. }) =
                         Dialog::modify_style(app, selected)
                     {
-                        app.dialog = Some(Dialog::ModifyStyle { back: true, id, name, font, size, bold, italic, color, before, after });
+                        app.dialog = Some(Dialog::ModifyStyle { back: true, resume: None, id, name, font, size, bold, italic, color, before, after });
                     }
                 }
             }
@@ -2450,7 +2587,7 @@ fn manage_styles(app: &mut WordApp, ui: &mut Ui, alphabetical: &mut bool, select
         if ui.add_enabled(ty != "table", egui::Button::new(tl!("Modify…"))).clicked()
             && let Some(Dialog::ModifyStyle { id, name, font, size, bold, italic, color, before, after, .. }) = Dialog::modify_style(app, selected)
         {
-            app.dialog = Some(Dialog::ModifyStyle { back: true, id, name, font, size, bold, italic, color, before, after });
+            app.dialog = Some(Dialog::ModifyStyle { back: true, resume: None, id, name, font, size, bold, italic, color, before, after });
         }
         if ui.button(tl!("New Style…")).clicked() {
             app.dialog = Some(Dialog::NewStyle { name: "Style1".into(), based_on: str_of(&cur, "name"), back: true });
@@ -2772,5 +2909,33 @@ mod tests {
         for t in &tops {
             assert!((t - tops[0]).abs() <= 0.5, "the tab strip stays put: {tops:?}");
         }
+    }
+
+    #[test]
+    fn font_dialog_ok_keeps_what_the_user_left_alone() {
+        // Issue #466: OK sent every field, clearing small caps, spacing and double underline
+        // when only the size changed.
+        let mut app = app_with("Example");
+        let _ = app.run("select.all", json!({}));
+        let _ = app.run("format.set", json!({"props": {"smallCaps": true, "caps": true, "hidden": true, "spacing": 2, "underline": "double"}}));
+        let Some(mut d) = Dialog::open("font", &mut app) else { panic!("no font dialog") };
+        if let Dialog::Font { size, small_caps, spacing, .. } = &mut d {
+            assert!(*small_caps, "the dialog shows small caps");
+            assert_eq!(*spacing, 2.0);
+            *size = "14".into();
+        }
+        apply_font(&mut app, &d);
+        let c = app.session.doc.para_at(&wordcraft_doc::Pos::body(0, 0)).map(|p| p.props_of_char(0).clone()).unwrap_or_default();
+        assert_eq!(c.size, Some(14.0));
+        assert_eq!((c.small_caps, c.caps, c.hidden, c.spacing), (Some(true), Some(true), Some(true), Some(2.0)));
+        assert_eq!(c.underline, Some(wordcraft_doc::props::Underline::Double));
+        // A field the user does change still applies.
+        let Some(mut d) = Dialog::open("font", &mut app) else { panic!("no font dialog") };
+        if let Dialog::Font { small_caps, .. } = &mut d {
+            *small_caps = false;
+        }
+        apply_font(&mut app, &d);
+        let c = app.session.doc.para_at(&wordcraft_doc::Pos::body(0, 0)).map(|p| p.props_of_char(0).clone()).unwrap_or_default();
+        assert_eq!((c.small_caps, c.caps, c.size), (Some(false), Some(true), Some(14.0)));
     }
 }
