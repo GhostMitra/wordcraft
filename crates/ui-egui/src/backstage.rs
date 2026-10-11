@@ -58,6 +58,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
             ui.add_space(if mac { 12.0 } else { 6.0 });
             for (id, label) in PAGES {
                 let (r, resp) = ui.allocate_exact_size(vec2(200.0, 38.0), Sense::click());
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tl!(label)));
                 let active = app.ui.backstage_page == id;
                 if active {
                     ui.painter().rect_filled(r, 0.0, egui::Color32::from_white_alpha(46));
@@ -74,13 +75,16 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                 if resp.clicked() {
                     match id {
                         "save" => {
-                            let _ = app.run("file.save", json!({}));
+                            let r = app.run("file.save", json!({}));
+                            if r.is_ok_and(|v| v.get("saved").and_then(serde_json::Value::as_bool) == Some(true) || v.get("downloaded").is_some()) {
+                                app.ui.backstage = false;
+                                app.canvas.want_focus = true;
+                            } else {
+                                app.ui.backstage_page = "saveAs".into();
+                            }
                         }
                         "saveAs" => {
-                            app.save_as_dialog();
-                        }
-                        "open" => {
-                            app.ui.backstage_page = id.into();
+                            app.ui.backstage_page = "saveAs".into();
                         }
                         _ => app.ui.backstage_page = id.into(),
                     }
@@ -89,6 +93,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                 for (label, id) in [("About", "about"), ("Discord community", "discord")] {
                     let (r, resp) = ui.allocate_exact_size(vec2(200.0, 32.0), Sense::click());
+                    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tl!(label)));
                     if resp.hovered() {
                         ui.painter().rect_filled(r, 0.0, egui::Color32::from_white_alpha(26));
                     }
@@ -108,6 +113,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
             "home" => home_page(app, ui),
             "new" => new_page(app, ui),
             "open" => open_page(app, ui),
+            "saveAs" => save_as_page(app, ui),
             "info" => info_page(app, ui),
             "print" | "export" => export_page(app, ui),
             "options" => options_page(app, ui),
@@ -261,6 +267,15 @@ fn open_page(app: &mut WordApp, ui: &mut Ui) {
     heading(ui, "Open");
     if ui.button(egui::RichText::new(tl!("Browse…")).font(medium(14.0))).clicked() {
         let _ = app.run("ui.openFileDialog", json!({}));
+    }
+    ui.add_space(18.0);
+    open_list(app, ui);
+}
+
+fn save_as_page(app: &mut WordApp, ui: &mut Ui) {
+    heading(ui, "Save As");
+    if ui.button(egui::RichText::new(tl!("Browse…")).font(medium(14.0))).clicked() {
+        app.save_as_dialog();
     }
     ui.add_space(18.0);
     open_list(app, ui);
@@ -591,5 +606,86 @@ mod tests {
         assert_eq!((a.session.doc.core.title.as_str(), a.session.doc.core.creator.as_str()), ("ALPHA", ""));
         a.session.run("edit.undo", &json!({})).unwrap();
         assert_eq!(a.session.doc.core.title, "");
+    }
+
+    #[test]
+    fn save_as_page_shows_browse_and_recent() {
+        let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Services::default());
+        a.run("ui.backstage", json!({"value": true, "page": "saveAs"})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            a,
+        );
+        h.run_steps(4);
+        assert!(h.query_by_label("Browse…").is_some(), "Save As has Browse button");
+        assert!(h.query_by_label("Recent").is_some(), "Save As lists recent documents");
+    }
+
+    #[test]
+    fn backstage_save_navigates_to_save_as_when_unnamed() {
+        let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Services::default());
+        a.run("ui.backstage", json!({"value": true, "page": "home"})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            a,
+        );
+        h.run_steps(4);
+        h.get_by_label("Save").click();
+        h.run_steps(4);
+        assert_eq!(h.state().ui.backstage_page, "saveAs", "unnamed Save opens Save As page");
+        assert!(h.state().ui.backstage, "backstage remains open");
+    }
+
+    #[test]
+    fn backstage_save_closes_when_saved() {
+        let got: std::rc::Rc<std::cell::RefCell<Vec<(String, Vec<u8>)>>> = Default::default();
+        let sink = got.clone();
+        let services = Services {
+            download: Some(Box::new(move |n: &str, b: &[u8]| {
+                sink.borrow_mut().push((n.to_string(), b.to_vec()));
+                Ok(())
+            })),
+            ..Default::default()
+        };
+        let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), services);
+        a.run("ui.backstage", json!({"value": true, "page": "home"})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            a,
+        );
+        h.run_steps(4);
+        h.get_by_label("Save").click();
+        h.run_steps(4);
+        assert!(!h.state().ui.backstage, "successful save closes backstage");
+    }
+
+    #[test]
+    fn backstage_save_as_sidebar_opens_save_as_page() {
+        let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Services::default());
+        a.run("ui.backstage", json!({"value": true, "page": "home"})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            a,
+        );
+        h.run_steps(4);
+        h.get_by_label("Save As").click();
+        h.run_steps(4);
+        assert_eq!(h.state().ui.backstage_page, "saveAs");
     }
 }
