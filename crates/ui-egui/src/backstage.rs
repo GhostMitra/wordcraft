@@ -74,6 +74,12 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                 );
                 if resp.clicked() {
                     match id {
+                        // A document without a file goes to the Save As page (as in Word) instead
+                        // of `file.save`, which would also open the native Save As dialog.
+                        // In the browser a save is a download, so it saves right away.
+                        "save" if app.session.path.is_none() && app.services.download.is_none() => {
+                            app.ui.backstage_page = "saveAs".into();
+                        }
                         "save" => {
                             let r = app.run("file.save", json!({}));
                             if r.is_ok_and(|v| v.get("saved").and_then(serde_json::Value::as_bool) == Some(true) || v.get("downloaded").is_some()) {
@@ -272,13 +278,13 @@ fn open_page(app: &mut WordApp, ui: &mut Ui) {
     open_list(app, ui);
 }
 
+/// Save As: Browse… asks where to save. It has no recent-documents list: clicking one of those
+/// opens it, which is not what Save As is for.
 fn save_as_page(app: &mut WordApp, ui: &mut Ui) {
     heading(ui, "Save As");
     if ui.button(egui::RichText::new(tl!("Browse…")).font(medium(14.0))).clicked() {
         app.save_as_dialog();
     }
-    ui.add_space(18.0);
-    open_list(app, ui);
 }
 
 fn info_page(app: &mut WordApp, ui: &mut Ui) {
@@ -609,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn save_as_page_shows_browse_and_recent() {
+    fn save_as_page_shows_browse_and_no_open_list() {
         let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Services::default());
         a.run("ui.backstage", json!({"value": true, "page": "saveAs"})).unwrap();
         let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
@@ -622,7 +628,7 @@ mod tests {
         );
         h.run_steps(4);
         assert!(h.query_by_label("Browse…").is_some(), "Save As has Browse button");
-        assert!(h.query_by_label("Recent").is_some(), "Save As lists recent documents");
+        assert!(h.query_by_label("Recent").is_none(), "Save As has no list that opens documents");
     }
 
     #[test]
@@ -642,6 +648,36 @@ mod tests {
         h.run_steps(4);
         assert_eq!(h.state().ui.backstage_page, "saveAs", "unnamed Save opens Save As page");
         assert!(h.state().ui.backstage, "backstage remains open");
+    }
+
+    /// Save on a document without a file shows the Save As page only: no native dialog as well.
+    #[test]
+    fn backstage_save_when_unnamed_opens_no_file_dialog() {
+        let shown = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = shown.clone();
+        let services = Services {
+            file_dialog: Some(Box::new(move |_| {
+                count.set(count.get() + 1);
+                std::sync::mpsc::channel::<Option<String>>().1
+            })),
+            ..Default::default()
+        };
+        let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), services);
+        a.run("ui.backstage", json!({"value": true, "page": "home"})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            a,
+        );
+        h.run_steps(4);
+        h.get_by_label("Save").click();
+        h.run_steps(4);
+        assert_eq!(h.state().ui.backstage_page, "saveAs");
+        assert_eq!(shown.get(), 0, "no native Save As dialog");
+        assert!(!h.state().file_dialog_open());
     }
 
     #[test]
