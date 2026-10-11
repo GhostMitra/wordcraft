@@ -199,20 +199,130 @@ fn guard_unload(dirty: Rc<Cell<bool>>) -> Result<(), String> {
     Ok(())
 }
 
-/// Trigger a browser download of `bytes` named after the last component of `path`.
+/// Trigger a browser save dialog or download of `bytes` named after the last component of `path`.
 fn download(path: &str, bytes: &[u8]) -> Result<(), String> {
-    let js = |e: wasm_bindgen::JsValue| format!("{e:?}");
     let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "document".into());
     let window = web_sys::window().ok_or("no window")?;
+
+    // On browsers supporting the File System Access API (Chromium: Chrome, Edge, etc.),
+    // `showSaveFilePicker` lets the user choose the save location and filename natively.
+    if let Ok(picker_val) = js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str("showSaveFilePicker"))
+        && let Ok(picker_fn) = picker_val.dyn_into::<js_sys::Function>()
+    {
+        match trigger_save_file_picker(&window, &picker_fn, &name, bytes) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                log::warn!("showSaveFilePicker failed: {e}; falling back to anchor download");
+            }
+        }
+    }
+
+    // Fallback for browsers without showSaveFilePicker (e.g. Firefox, Safari):
+    trigger_anchor_download(&window, &name, bytes)
+}
+
+fn trigger_save_file_picker(window: &web_sys::Window, picker_fn: &js_sys::Function, name: &str, bytes: &[u8]) -> Result<(), String> {
+    let js = |e: wasm_bindgen::JsValue| format!("{e:?}");
+    let ext = std::path::Path::new(name).extension().and_then(|e| e.to_str()).unwrap_or("docx").to_ascii_lowercase();
+    let dot_ext = format!(".{ext}");
+    let mime = mime_for(name);
+
+    let accept_obj = js_sys::Object::new();
+    let exts_arr = js_sys::Array::new();
+    exts_arr.push(&wasm_bindgen::JsValue::from_str(&dot_ext));
+    let _ = js_sys::Reflect::set(&accept_obj, &wasm_bindgen::JsValue::from_str(mime), &exts_arr);
+
+    let type_desc = match ext.as_str() {
+        "docx" => "Word Document (*.docx)",
+        "docm" => "Word Macro-Enabled Document (*.docm)",
+        "dotx" => "Word Template (*.dotx)",
+        "dotm" => "Word Macro-Enabled Template (*.dotm)",
+        "odt" => "OpenDocument Text (*.odt)",
+        "rtf" => "Rich Text Format (*.rtf)",
+        "txt" => "Plain Text (*.txt)",
+        "pdf" => "PDF Document (*.pdf)",
+        "png" => "PNG Image (*.png)",
+        "html" | "htm" => "HTML Document (*.html)",
+        "json" => "JSON Document (*.json)",
+        _ => "Document",
+    };
+
+    let type_obj = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&type_obj, &wasm_bindgen::JsValue::from_str("description"), &wasm_bindgen::JsValue::from_str(type_desc));
+    let _ = js_sys::Reflect::set(&type_obj, &wasm_bindgen::JsValue::from_str("accept"), &accept_obj);
+
+    let types_arr = js_sys::Array::new();
+    types_arr.push(&type_obj);
+
+    let picker_opts = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&picker_opts, &wasm_bindgen::JsValue::from_str("suggestedName"), &wasm_bindgen::JsValue::from_str(name));
+    let _ = js_sys::Reflect::set(&picker_opts, &wasm_bindgen::JsValue::from_str("types"), &types_arr);
+
+    // Call showSaveFilePicker synchronously while transient user activation is active:
+    let prom_val = picker_fn.call1(window, &picker_opts).map_err(js)?;
+    let prom: js_sys::Promise = prom_val.dyn_into().map_err(|_| "not a promise".to_string())?;
+
+    let bytes_vec = bytes.to_vec();
+    wasm_bindgen_futures::spawn_local(async move {
+        match wasm_bindgen_futures::JsFuture::from(prom).await {
+            Ok(handle_val) => {
+                if let Err(e) = write_file_handle(&handle_val, &bytes_vec).await {
+                    log::error!("failed writing to file handle: {e}");
+                } else {
+                    log::info!("successfully saved file through save file picker");
+                }
+            }
+            Err(e) => {
+                let err_name =
+                    js_sys::Reflect::get(&e, &wasm_bindgen::JsValue::from_str("name")).ok().and_then(|v| v.as_string()).unwrap_or_default();
+                if err_name == "AbortError" {
+                    log::debug!("save file dialog cancelled by user");
+                } else {
+                    log::error!("showSaveFilePicker error: {e:?}");
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+async fn write_file_handle(handle: &wasm_bindgen::JsValue, bytes: &[u8]) -> Result<(), String> {
+    let js = |e: wasm_bindgen::JsValue| format!("{e:?}");
+    let create_fn: js_sys::Function = js_sys::Reflect::get(handle, &wasm_bindgen::JsValue::from_str("createWritable"))
+        .map_err(js)?
+        .dyn_into()
+        .map_err(|_| "createWritable is not a function".to_string())?;
+    let stream_prom: js_sys::Promise = create_fn.call0(handle).map_err(js)?.dyn_into().map_err(|_| "not a promise".to_string())?;
+    let stream = wasm_bindgen_futures::JsFuture::from(stream_prom).await.map_err(js)?;
+
+    let write_fn: js_sys::Function = js_sys::Reflect::get(&stream, &wasm_bindgen::JsValue::from_str("write"))
+        .map_err(js)?
+        .dyn_into()
+        .map_err(|_| "write is not a function".to_string())?;
+    let uint8 = js_sys::Uint8Array::from(bytes);
+    let write_prom: js_sys::Promise = write_fn.call1(&stream, &uint8).map_err(js)?.dyn_into().map_err(|_| "not a promise".to_string())?;
+    wasm_bindgen_futures::JsFuture::from(write_prom).await.map_err(js)?;
+
+    let close_fn: js_sys::Function = js_sys::Reflect::get(&stream, &wasm_bindgen::JsValue::from_str("close"))
+        .map_err(js)?
+        .dyn_into()
+        .map_err(|_| "close is not a function".to_string())?;
+    let close_prom: js_sys::Promise = close_fn.call0(&stream).map_err(js)?.dyn_into().map_err(|_| "not a promise".to_string())?;
+    wasm_bindgen_futures::JsFuture::from(close_prom).await.map_err(js)?;
+    Ok(())
+}
+
+fn trigger_anchor_download(window: &web_sys::Window, name: &str, bytes: &[u8]) -> Result<(), String> {
+    let js = |e: wasm_bindgen::JsValue| format!("{e:?}");
     let document = window.document().ok_or("no document")?;
     let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(bytes));
     let opts = web_sys::BlobPropertyBag::new();
-    opts.set_type(mime_for(&name));
+    opts.set_type(mime_for(name));
     let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &opts).map_err(js)?;
     let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(js)?;
-    let a: web_sys::HtmlAnchorElement = document.create_element("a").map_err(js)?.dyn_into().map_err(|_| "not an anchor")?;
+    let a: web_sys::HtmlAnchorElement = document.create_element("a").map_err(js)?.dyn_into().map_err(|_| "not an anchor".to_string())?;
     a.set_href(&url);
-    a.set_download(&name);
+    a.set_download(name);
     a.style().set_property("display", "none").map_err(js)?;
     let body = document.body().ok_or("no body")?;
     body.append_child(&a).map_err(js)?;
