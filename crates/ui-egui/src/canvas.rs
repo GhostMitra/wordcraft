@@ -820,7 +820,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     // Keys first, so this frame lays out and paints what was typed (handled after painting, a
     // keystroke showed one frame later). Focus is the canvas's from the last frame.
     // While "Save changes?" is up, keys answer it rather than edit the document behind it.
-    if (app.canvas.focused || app.canvas.want_focus) && !matches!(app.dialog, Some(crate::dialogs::Dialog::SaveChanges { .. })) {
+    if app.canvas.focused && !matches!(app.dialog, Some(crate::dialogs::Dialog::SaveChanges { .. })) {
         crate::keys::canvas_events(app, ui.ctx());
     } else {
         // Alt+numpad entry doesn't survive the canvas losing the keyboard.
@@ -1438,9 +1438,6 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     {
         deselect_balloon(app, ui.ctx());
     }
-    // Focus: the canvas takes keyboard focus on click and keeps Tab/arrows.
-    let requested = resp.clicked() || resp.drag_started() || app.canvas.want_focus;
-    if requested {
     // Space and Enter also set `Response::clicked` on a focused click-sensing widget
     // (egui's fake primary click). `request_focus` always interrupts IME; on X11 that
     // destroys the XIM context and fcitx then drops every later key (#1169). A pointer
@@ -1457,15 +1454,13 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     if focus_click || app.canvas.want_focus {
         app.canvas.want_focus = false;
     }
-    let focused = resp.has_focus() || requested;
-    if focused {
     app.canvas.widget_id = Some(resp.id);
     if resp.has_focus() {
         ui.memory_mut(|m| {
             m.set_focus_lock_filter(resp.id, egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true })
         });
     }
-    app.canvas.focused = focused;
+    app.canvas.focused = resp.has_focus();
     // Screen readers: the document under the canvas, with the caret (#488).
     crate::a11y::expose(app, ui.ctx(), resp.id, &layout, &rects, area);
     // The buttons that start or stop middle-click scrolling don't also click the page.

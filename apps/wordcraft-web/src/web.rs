@@ -28,7 +28,7 @@ pub fn start() {
             return;
         };
         let dirty = Rc::new(Cell::new(false));
-        let saves = Rc::new(PickerSaves::default());
+        let saves = AsyncSaves::default();
         // `?host=parent`: a same-origin page framing WordCraft (such as a Nextcloud app) opens
         // documents in it and stores what it saves (`host`).
         let bridge = if query_param("host").as_deref() == Some("parent") { crate::host::Bridge::new() } else { None };
@@ -36,8 +36,6 @@ pub fn start() {
         if bridge.is_none()
             && let Err(e) = guard_unload(dirty.clone(), saves.clone())
         {
-        let saves = AsyncSaves::default();
-        if let Err(e) = guard_unload(dirty.clone(), saves.clone()) {
             log::error!("no unsaved-changes guard: {e}");
         }
         let mut options = eframe::WebOptions::default();
@@ -68,13 +66,12 @@ pub fn start() {
                     let doc = if sample { wordcraft_engine::sample::sample_document() } else { wordcraft_engine::blank_document(&region) };
                     let mut session = Session::new(doc);
                     session.system_region = region;
-                    let mut services = services(inbox.clone(), cc.egui_ctx.clone(), dirty, saves.clone());
+                    let messages = Rc::new(RefCell::new(Vec::new()));
+                    let mut services = services(inbox.clone(), cc.egui_ctx.clone(), dirty, saves.clone(), messages.clone());
                     if let Some(bridge) = &app_bridge {
                         bridge.connect(&mut services, inbox.clone(), cc.egui_ctx.clone());
                     }
                     let mut app = WordApp::new(session, services);
-                    let messages = Rc::new(RefCell::new(Vec::new()));
-                    let mut app = WordApp::new(session, services(inbox.clone(), cc.egui_ctx.clone(), dirty, saves.clone(), messages.clone()));
                     // Pasted pictures wait apart from dropped files: the app inserts one only when the page is the edit target (#1349).
                     app.services.pasted = Some(pasted);
                     app.autosave = false;
@@ -89,8 +86,7 @@ pub fn start() {
                         }
                         bridge.post_ready();
                     }
-                    Ok(Box::new(WebShell { app, inbox, saves, bridge: app_bridge }))
-                    Ok(Box::new(WebShell { app, inbox, messages }))
+                    Ok(Box::new(WebShell { app, inbox, messages, bridge: app_bridge }))
                 }),
             )
             .await;
@@ -119,40 +115,8 @@ fn query_param(key: &str) -> Option<String> {
 struct WebShell {
     app: WordApp,
     inbox: Inbox,
-    saves: Rc<PickerSaves>,
-    bridge: Option<crate::host::Bridge>,
-}
-
-/// Saves the browser's save picker finishes after `download` has returned (#728). The app marks
-/// the document saved as soon as `download` returns, so a cancelled or failed picker save must
-/// mark it unsaved again, and the `beforeunload` guard keeps warning while one is in flight.
-#[derive(Default)]
-struct PickerSaves {
-    /// Picker saves started and not yet written and closed.
-    pending: Cell<u32>,
-    /// Picker saves that didn't write the file: (name, error, or `None` when cancelled).
-    unsaved: RefCell<Vec<(String, Option<String>)>>,
-}
-
-impl WebShell {
-    /// A picker save that didn't happen leaves the document with unsaved changes.
-    fn settle_picker_saves(&mut self) {
-        let unsaved = std::mem::take(&mut *self.saves.unsaved.borrow_mut());
-        for (name, error) in unsaved {
-            // Only a save in a format that keeps everything marked the document saved.
-            if wordcraft_ui_egui::keeps_everything(&name) {
-                self.app.session.dirty = true;
-            }
-            if let Some(error) = error {
-                let msg = wordcraft_ui_egui::i18n::fmt(
-                    wordcraft_ui_egui::i18n::t("Couldn't download {name}: {error}"),
-                    &[("name", &name), ("error", &error)],
-                );
-                self.app.status(msg);
-            }
-        }
-    }
     messages: Rc<RefCell<Vec<String>>>,
+    bridge: Option<crate::host::Bridge>,
 }
 
 impl eframe::App for WebShell {
